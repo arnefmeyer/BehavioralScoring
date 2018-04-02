@@ -1,0 +1,8 @@
+numpy
+scipy
+matplotlib
+scikit-learn
+opencv
+tqdm
+pyqt
+click
