@@ -13,16 +13,18 @@
     Todo:
     - replace slow matplotlib-based class assignment panel by qt, pyqtgraph or
       similar
-    - move to "widgets" submodule and pass functions or classes that determine
-      how to read/convert the video data
 """
 
+from __future__ import print_function
+
+from six import string_types
 import os
 import os.path as op
 import sys
 import glob
 import numpy as np
 from scipy import ndimage
+from scipy import signal
 from tqdm import tqdm
 import cv2
 import time
@@ -61,7 +63,7 @@ except ImportError:
     cv.CreateTrackbar = cv2.createTrackbar
     CV_VERSION = 3
 
-print "Using opencv version:", CV_VERSION
+print("Using opencv version:", CV_VERSION)
 
 
 def read_frames(frame_path, start_index=0, subsample=2,
@@ -72,10 +74,10 @@ def read_frames(frame_path, start_index=0, subsample=2,
     ts_file = glob.glob(op.join(frame_path, '*.csv'))
     if len(ts_file) > 0:
         ts_info = np.loadtxt(ts_file[0], delimiter=',')
-        print "Reading timestamps from csv file"
+        print("Reading timestamps from csv file")
     else:
         ts_info = None
-        print "Extracting timestamps from file names"
+        print("Extracting timestamps from file names")
 
     files = os.listdir(frame_path)
     files = [f for f in files if f.endswith('.jpg')]
@@ -155,57 +157,101 @@ def read_frames(frame_path, start_index=0, subsample=2,
 
 class VideoDataHandler():
 
-    def __init__(self, frame_path,
-                 start_index=0,
+    def __init__(self, video_file,
+                 timestamps=None,
+                 annotations=None,
+                 fps=30.,
                  subsample=2,
                  max_num_frames=np.Inf,
                  use_memmap=True,
                  force_reload=False,
-                 assigned_groups=None,
-                 groups=None):
+                 output_format='csv'):
 
-        self.frame_path = frame_path
-        self.start_index = start_index
+        vid_format = op.splitext(video_file)[1]
+        if vid_format == '.h264' and timestamps is None:
+            raise ValueError('h264 format requires timestamps')
+
+        self.video_file = video_file
+        self.timestamps = timestamps
+        self.annotations = annotations
+        self.fps = fps
         self.subsample = subsample
         self.max_num_frames = max_num_frames
         self.use_memmap = use_memmap
         self.force_reload = force_reload
-        self.assigned_groups = assigned_groups
-        self.groups = groups
-
-        self.timestamps = None
-        self.start_time = None
-        self.valid = None
-        self.samplerate = None
+        self.output_format = output_format
 
         self._fp = None
 
     def prepare(self):
 
-        ts_file = op.join(self.frame_path, 'timestamps.npz')
-        ts_info = np.load(ts_file)
-        dd = ts_info['hardware'].item()
-        timestamps = dd['timestamps']
-        fs = float(dd['samplerate'])
-        start_time = dd['start_time']
-        valid = ts_info['valid']
+        video_path = op.split(self.video_file)[0]
+        filename = op.splitext(op.split(self.video_file)[1])[0]
+
+        # check video timestamps
+        ts = self.timestamps
+        if isinstance(ts, string_types) and op.exists(ts):
+            self.timestamp_file = ts
+            ext = op.splitext(ts)[1]
+            if ext == '.txt':
+                ts = np.loadtxt(ts)
+            elif ext == '.csv':
+                ts = np.loadtxt(ts, delimiter=',')
+            elif ext == '.npy':
+                ts = np.load(ts)
+            else:
+                raise ValueError('invalid timestamp file extension: ' + ext)
+
+        else:
+            self.timestamp_file = op.join(video_path,
+                                          filename + '_timestamps.' +
+                                          self.output_format)
+
+        # check annotations
+        annot = self.annotations
+        if isinstance(annot, string_types) and op.exists(annot):
+            annot_file = annot
+            ext = op.splitext(annot)[1]
+            if ext == '.txt':
+                annot = np.loadtxt(annot)
+            elif ext == '.csv':
+                annot = np.loadtxt(annot, delimiter=',')
+            elif ext == '.npy':
+                annot = np.load(annot)
+            else:
+                raise ValueError('invalid annotation file extension: ' + ext)
+
+            self.annotations = annot
+            self.annotation_file = annot_file
+        else:
+            self.annotation_file = op.join(video_path,
+                                           filename + '_annotations.' +
+                                           self.output_format)
+            if annot is None:
+                self.annotations = np.NaN * np.zeros((ts.shape[0]),
+                                                     dtype=np.int)
 
         # save frames to memory-mapped file
-        memmap_file = op.join(self.frame_path, 'frames.memmap')
-        param_file = op.join(self.frame_path, 'frames.params')
+        memmap_file = op.join(video_path, filename + '.memmap')
+        param_file = op.join(video_path, filename + 'memmap.params')
 
-        if not op.exists(memmap_file):
+        if not op.exists(memmap_file) or self.force_reload:
 
             import imageio
 
-            # TODO: do this in a separate function or even create classes to
-            # parse different types of inputs
-            mp4_file = glob.glob(op.join(self.frame_path, '*.mp4'))[0]
-
             fp = None
-            n_frames = len(timestamps)
 
-            with imageio.get_reader(mp4_file, 'ffmpeg') as reader:
+            frame_cnt = 0
+            _fps = None
+            with imageio.get_reader(self.video_file, 'ffmpeg') as reader:
+
+                vid_format = op.splitext(self.video_file)[1]
+                if vid_format != '.h264':
+                    meta = reader.get_meta_data()
+                    fps = meta['fps']
+                    n_frames = meta['nframes']
+                else:
+                    n_frames = len(ts)
 
                 for i, frame in enumerate(tqdm(reader)):
 
@@ -221,99 +267,32 @@ class VideoDataHandler():
                                        mode='w+',
                                        shape=shape)
                     fp[i, :, :] = frame
+                    frame_cnt += 1
 
-                    if i+1 >= n_frames:
+                    if i+1 >= self.max_num_frames:
                         break
 
-                del fp
+                del fp  # -> flush
+
+                if _fps is not None:
+                    fps = _fps
+                else:
+                    fps = self.fps
+
+                if ts is None:
+                    ts = np.arange(frame_cnt) / float(fps)
 
             with open(param_file, 'w') as pf:
-                pickle.dump(shape, pf)
+                pickle.dump({'shape': shape,
+                             'ts': ts,
+                             'fps': self.fps}, pf)
 
         else:
             with open(param_file, 'r') as f:
-                shape = pickle.load(f)
-
-        self.frame_rate = 1. / np.mean(np.diff(timestamps))
-#        files = glob.glob(op.join(self.frame_path, '*.jpg'))
-#        files.sort()
-#        n_files = int(min(len(files), self.max_num_frames))
-#        files = files[:n_files]
-#
-#        # processor start time and sample rate
-#        ts_file = op.join(self.frame_path, 'timestamps.npz')
-#        if op.exists(ts_file):
-#            tmp = np.load(ts_file)['hardware'].item()
-#            start_time = tmp['start_time']
-#            fs = float(tmp['samplerate'])
-#        else:
-#            # load first timestamp from recording directory
-#            start_times = np.load(op.join(self.frame_path, '..',
-#                                          'start_times.npz'))['Node100'].item()
-#            fs = float(start_times['samplerate'])
-#            start_time = start_times['timestamp'] / fs
-#
-#        # load timestamps
-#        csv_file = glob.glob(op.join(self.frame_path, '*.csv'))
-#
-#        if len(csv_file) > 0:
-#            print "Reading timestamps from csv file"
-#            ts_info = np.loadtxt(csv_file[0], delimiter=',')
-#            timestamps = ts_info[:, 3] / fs - start_time
-#
-#        else:
-#            print "Extracting timestamps from file names"
-#            timestamps = np.zeros((n_files,))
-#            for i, f in enumerate(files):
-#                ts = int(op.splitext(f)[0].split('_')[-1])
-#                timestamps[i] = ts / fs - start_time
-#
-#        timestamps = timestamps[:n_files]
-#
-#        # check for invalid (0 bytes) files
-#        valid = np.ones((len(files),), dtype=np.bool)
-#        for i, f in enumerate(files):
-#            if op.getsize(f) == 0:
-#                valid[i] = False
-#
-#        timestamps = timestamps[valid]
-#        n_valid = np.sum(valid)
-#
-#        # save frames to memory-mapped file
-#        memmap_file = op.join(self.frame_path, 'frames.memmap')
-#        param_file = op.join(self.frame_path, 'frames.params')
-#
-#        if not op.exists(memmap_file):
-#
-#            fp = None
-#            cnt = 0
-#            for i, f in enumerate(tqdm(files)):
-#
-#                if valid[i]:
-#
-#                    img = ndimage.imread(f, flatten=True).astype(np.uint8)
-#
-#                    if self.subsample > 1:
-#                        img = img[::self.subsample, ::self.subsample]
-#
-#                    shape = (n_valid, img.shape[0], img.shape[1])
-#
-#                    if fp is None:
-#                        fp = np.memmap(memmap_file,
-#                                       dtype=np.uint8,
-#                                       mode='w+',
-#                                       shape=shape)
-#                    fp[cnt, :, :] = img
-#                    cnt += 1
-#
-#            del fp
-#
-#            with open(param_file, 'w') as pf:
-#                pickle.dump(shape, pf)
-#
-#        else:
-#            with open(param_file, 'r') as f:
-#                shape = pickle.load(f)
+                params = pickle.load(f)
+                shape = params['shape']
+                ts = params['ts']
+                fps = params['fps']
 
         self.memmap_file = memmap_file
         self.param_file = param_file
@@ -322,10 +301,21 @@ class VideoDataHandler():
                              dtype=np.uint8,
                              mode='r',
                              shape=shape)
-        self.timestamps = timestamps
-        self.samplerate = fs
-        self.start_time = start_time
-        self.valid = valid
+        self.timestamps = ts
+        self.fps = fps
+
+    def save(self):
+
+        print("Saving annotations to file:", self.annotation_file)
+        print("Saving timestamps to file:", self.timestamp_file)
+
+        if self.output_format == 'csv':
+            np.savetxt(self.annotation_file, self.annotations, fmt='%d')
+            np.savetxt(self.timestamp_file, self.timestamps)
+
+        elif self.output_format == 'npy':
+            np.save(self.annotation_file, self.annotations)
+            np.save(self.timestamp_file, self.timestamps)
 
     def close(self):
 
@@ -334,7 +324,7 @@ class VideoDataHandler():
             del self._fp
             self._fp = None
 
-    def remove(self):
+    def cleanup(self):
 
         for f in [self.memmap_file,
                   self.param_file]:
@@ -352,165 +342,55 @@ class VideoDataHandler():
         return self._fp[index, :, :], self.timestamps[index]
 
 
-class AccelerometerDataHandler():
-
-    def __init__(self, rec_path, samplerate=100.):
-
-        from scipy import signal
-
-        self.rec_path = rec_path
-        self.samplerate = float(samplerate)
-
-        tmp = np.load(op.join(rec_path, 'aux_channels.npz'))
-        D = tmp['data']
-        fs = tmp['samplerate']
-
-        f_lower = 1.
-        f_upper = .4 * samplerate
-#        Wn = f_upper / fs * 2
-        Wn = (f_lower / fs * 2, f_upper / fs * 2)
-        b, a = signal.butter(2, Wn, btype='bandpass',
-                             analog=False, output='ba')
-        DD = signal.filtfilt(b, a, D, axis=0)
-
-        n = int(round(fs / samplerate))
-        A = np.sum(np.abs(DD[::n, :]), axis=1)
-        ts = np.arange(A.shape[0]) / self.samplerate
-
-        self.data = A
-        self.timestamps = ts
-
-
 class LfpDataHandler():
+    """simple class to hold LFP data
 
-    def __init__(self, rec_path, samplerate=50.):
+        Assumed data format:
+            - numpy npz file with variables:
+            - data: array with LFP data [num_channels x observations]
+            - samplerate: sampling frequency (in Hz)
 
-        from lindenlab.io import database as lldb
-        from lindenlab.util import filter_data, compute_envelope
+        If there are multiple LFP channels the mean across all channels will
+        be used with subsequent lowpass filtering (and optionally subsampling)
+    """
 
-        self.rec_path = rec_path
-        self.samplerate = float(samplerate)
+    def __init__(self, lfp_file, samplerate=50., f_lowpass=10):
 
-        D, fs = lldb.load_lfp_data(rec_path, ignore_dead_channels=True)
+        assert op.exists(lfp_file)
 
-        D = filter_data(D, fs, f_lower=150, filt_type='highpass')
-        D = filter_data(compute_envelope(np.mean(D, axis=1)), fs,
-                        f_upper=25., filt_type='lowpass')
+        self.lfp_file = lfp_file
 
-        subsample = int(round(fs / samplerate))
-        D = D[::subsample]
-        ts = np.arange(D.shape[0]) / (fs / subsample)
+        try:
+            data = np.load(lfp_file)
+            D = data['data']
+            fs = float(data['samplerate'])
 
-        self.data = D
-        self.timestamps = ts
+            self.samplerate = fs
+            if D.ndim > 1:
+                D = np.mean(D, axis=0)
 
+            Wn = f_lowpass / fs * 2.
+            b, a = signal.butter(4, Wn, btype='lowpass', analog=False,
+                                 output='ba')
+            D = signal.filtfilt(b, a, np.abs(D), axis=0)
 
-class ClassifiedDataHandler():
+            subsample = int(round(fs / samplerate))
+            D = D[::subsample]
+            ts = np.arange(D.shape[0]) / (fs / subsample)
 
-    def __init__(self, rec_path):
+            self.data = D
+            self.timestamps = ts
+            self.samplerate = fs / subsample
 
-        self.data = None
-        self.timestamps = None
-
-        self.file_path = op.join(rec_path, 'classified_behaviour.npz')
-
-        if op.exists(self.file_path):
-
-            tmp = np.load(self.file_path)
-            self.timestamps = tmp['timestamps']
-            self.data = tmp['pred_labels']
-
-
-class MousecamDataHandler():
-
-    def __init__(self, rec_path, subsample=2):
-
-        self.rec_path = rec_path
-        self.subsample = subsample
-
-        self._fp = None
-        self.video_file = None
-        self.data = None
-
-        self.load_data()
-
-    def load_data(self):
-
-        import imageio
-
-        video_files = glob.glob(op.join(self.rec_path, '*eye*.h264'))
-
-        if len(video_files) > 0:
-
-            video_file = video_files[0]
-
-            params = np.load(op.splitext(video_file)[0] + '.npz')
-            timestamps = params['timestamps']
-
-            memmap_file = op.splitext(video_file)[0] + '.memmap'
-            n_frames = len(timestamps)
-            sub = self.subsample
-            if not op.exists(memmap_file):
-
-                # open reader
-                reader = imageio.get_reader(video_file, 'ffmpeg')
-
-                # process frames
-                fp = None
-                size = None
-                for i in tqdm(range(n_frames)):
-
-                    frame = cv2.cvtColor(reader.get_data(i), cv.CV_BGR2GRAY)
-
-                    if i == 0:
-                        size = (n_frames, frame.shape[0]/sub,
-                                frame.shape[1]/sub)
-                        fp = np.memmap(memmap_file, dtype='uint8',
-                                       mode='w+', shape=size)
-
-                    fp[i, :, :] = frame[::sub,
-                                        ::sub]
-
-                # make sure to flush file
-                del fp
-
-            else:
-                reader = imageio.get_reader(video_file, 'ffmpeg')
-                frame = cv2.cvtColor(reader.get_data(0), cv.CV_BGR2GRAY)
-                size = (n_frames, frame.shape[0]/sub, frame.shape[1]/sub)
-
-            self.memmap_file = memmap_file
-            self.timestamps = timestamps
-            self._fp = np.memmap(memmap_file, dtype='uint8',
-                                 mode='r', shape=size)
-
-        else:
+        except BaseException:
+            print("Could not load LFP data from file:", lfp_file)
+            print("Reason:")
+            traceback.print_exc()
             self.data = None
-            self.timestamps = None
-            self.memmap_file = None
-            self._fp = None
+            self.samplerate = None
 
     def is_valid(self):
-
-        return self._fp is not None
-
-    def get_data(self, ts, tol=.05):
-
-        ind = np.where(np.abs(self.timestamps - ts) <= tol)[0]
-
-        if len(ind) > 0:
-            return self._fp[int(np.round(np.mean(ind))), :, :]
-        else:
-            return None
-
-    def close(self):
-
-        pass
-
-    def remove(self):
-
-        if self.memmap_file is not None and op.exists(self.memmap_file):
-            os.remove(self.memmap_file)
+        return self.data is not None
 
 
 class PlaybackHandler(QtCore.QObject):
@@ -600,8 +480,8 @@ class MPLWidget(qw.QWidget):
 
     def __init__(self, parent,
                  timestamps=None,
-                 n_groups=10,
-                 group_min=0,
+                 n_states=10,
+                 state_min=0,
                  width=5, height=8, dpi=100,
                  static_data=None,
                  overlay_data=None):
@@ -611,14 +491,13 @@ class MPLWidget(qw.QWidget):
         self.parent = parent
 
         self.timestamps = timestamps
-        self.n_groups = n_groups
-        self.group_min = group_min
+        self.n_states = n_states
+        self.state_min = state_min
         self.static_data = static_data
         self.overlay_data = overlay_data
 
         self.fig = Figure((width, height), dpi=dpi)
         self.ax = self.fig.add_subplot(111)
-        self.ax.hold(True)
 
         self.canvas = FigureCanvasQTAgg(self.fig)
         self.canvas.setParent(self)
@@ -649,10 +528,10 @@ class MPLWidget(qw.QWidget):
 
         y = np.zeros_like(x)
         self.lines = {}
-        for i in range(self.n_groups):
+        for i in range(self.n_states):
             self.lines[i] = ax.plot(x, y, 'ko-')[0]
 
-        self.pos_line = ax.plot([0, 0], [0, self.n_groups],
+        self.pos_line = ax.plot([0, 0], [0, self.n_states],
                                 '-', color=3*[.5])[0]
 
         if self.overlay_data is not None and \
@@ -678,10 +557,10 @@ class MPLWidget(qw.QWidget):
 
         ax.set_xlim(x.min()-1, x.max()+1)
         ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Assigned group')
-        ax.set_ylim(y_min, self.n_groups)
+        ax.set_ylabel('Assigned state')
+        ax.set_ylim(y_min, self.n_states)
 
-        ax.set_yticks(np.arange(self.group_min, self.n_groups))
+        ax.set_yticks(np.arange(self.state_min, self.n_states))
         ax.xaxis.set_major_locator(plt.MaxNLocator(5))
 
         # Hide the right and top spines
@@ -707,7 +586,7 @@ class MPLWidget(qw.QWidget):
 
         x = self.timestamps
 
-        for i in range(self.n_groups):
+        for i in range(self.n_states):
 
             yi = np.ma.masked_where(y != i, y)
             self.lines[i].set_data(x, yi)
@@ -715,20 +594,17 @@ class MPLWidget(qw.QWidget):
 
         if pos >= 0:
 
-            self.pos_line.set_data(2*[x[pos]], [0, self.n_groups])
+            self.pos_line.set_data(2*[x[pos]], [0, self.n_states])
             self.ax.draw_artist(self.pos_line)
 
-#        self.fig.canvas.blit(self.ax.bbox)
         self.fig.canvas.draw()
 
     def update_plot(self):
 
-        for i in range(self.n_groups):
+        for i in range(self.n_states):
             self.ax.draw_artist(self.lines[i])
 
         self.ax.draw_artist(self.pos_line)
-
-#        self.fig.canvas.blit(self.ax.bbox)
         self.fig.canvas.draw()
 
     def update_figure(self):
@@ -777,22 +653,22 @@ class MPLWidget(qw.QWidget):
 
 class AnnotatorWidget(qw.QWidget):
 
-    # behavioral state groups
-    _groups = {-1: 'Invalid',
-               0: 'Unclassified',
-               1: 'Active exploration',
-               2: 'Quiet wakefulness',
-               3: 'Grooming',
-               4: 'Rearing',
-               5: 'Eating',
-               6: 'Sleeping'}
+    # default behavioral states
+    _default_states = {-1: 'Invalid',
+                       0: 'Unclassified',
+                       1: 'Active exploration',
+                       2: 'Quiet wakefulness',
+                       3: 'Grooming',
+                       4: 'Rearing',
+                       5: 'Eating',
+                       6: 'Sleeping'}
 
     """
-    Dahwale et al. bioRxiv 2015:
+    Dahwale et al. eLife 2017;6:e27702
         grooming, eating, active exploration, task engagement, quiet
         wakefulness, rapid eye movement, slow wave sleep
 
-    Venkrataman et al. J Neurophysiol 2010:
+    Venkatraman et al. J Neurophysiol 104(1):569-75
         Grooming, Resting, Eating, Rearing
     """
 
@@ -800,42 +676,26 @@ class AnnotatorWidget(qw.QWidget):
     MODE_PLAYING = 0
     MODE_ASSIGNING = 1
 
-    def __init__(self, rec_path,
-                 max_num_frames=np.Inf, use_memmap=True,
-                 force_reload=False,
-                 keep_memmap_files=False,
-                 win_name="annotation window",
-                 show_accel_data=False):
+    def __init__(self, video_handler, lfp_handler=None,
+                 states=None, win_name="annotation window"):
 
         qw.QWidget.__init__(self)
 
-        self.rec_path = rec_path
-        self.max_num_frames = max_num_frames
-        self.use_memmap = use_memmap
-        self.force_reload = force_reload
-        self.win_name = win_name
-        self.keep_memmap_files = keep_memmap_files
+        self.video_handler = video_handler
+        self.lfp_handler = lfp_handler
+        self.win_name = win_name  # for opencv window
+
+        if states is None:
+            states = self._default_states
+        self.states = states
 
         self.current_frame = 0
-        self.current_group = 0
+        self.current_state = 0
         self.frame_rate = 10
         self.mode = self.MODE_PLAYING
         self.slider_is_moving = False
 
         self.thread = None
-
-        if show_accel_data:
-            # useful for debugging purposes
-            self.accel_data = AccelerometerDataHandler(rec_path)
-        else:
-            self.accel_data = None
-
-        self.lfp_data = LfpDataHandler(rec_path)
-        self.mousecam_data = MousecamDataHandler(rec_path)
-        self.classified_data = ClassifiedDataHandler(rec_path)
-
-        self.data = None
-        self.read_data()
 
         self.setWindowTitle('Video Annotator')
         mainbox = qw.QVBoxLayout(self)
@@ -907,27 +767,20 @@ class AnnotatorWidget(qw.QWidget):
         mainbox.addWidget(self.HLine())
 
         # behavioral state plot
-        static_data = [self.lfp_data]
-        if self.accel_data is not None:
-            static_data.append(self.accel_data)
+        static_data = None
+
+        if lfp_handler is not None:
+            static_data.append(lfp_handler)
 
         self.plot_widget = MPLWidget(self,
-                                     timestamps=self.data.timestamps,
-                                     n_groups=len(self.get_groups()),
-                                     group_min=min(self.get_groups()),
+                                     timestamps=video_handler.timestamps,
+                                     n_states=len(self.get_states()),
+                                     state_min=min(self.get_states()),
                                      width=5, height=4, dpi=100,
-                                     static_data=static_data,
-                                     overlay_data=self.classified_data)
+                                     static_data=static_data)
         self.plot_widget.labels_changed.connect(self.labels_changed)
         self.plot_widget.update_figure()
         mainbox.addWidget(self.plot_widget)
-
-        if show_accel_data:
-            # accelerometer signal widget
-            self.aux_widget = MPLWidget(self,
-                                        timestamps=self.data.timestamps,
-                                        n_groups=len(self.get_groups()),
-                                        width=5, height=4, dpi=100)
 
         self.plot_widget.labels_changed.connect(self.labels_changed)
         self.plot_widget.update_figure()
@@ -941,19 +794,11 @@ class AnnotatorWidget(qw.QWidget):
             cv2.namedWindow(win_name,
                             cv2.WINDOW_OPENGL | cv2.WND_PROP_ASPECT_RATIO)
 
-            if self.mousecam_data.is_valid():
-                cv2.namedWindow("mousecam",
-                                cv2.WINDOW_OPENGL | cv2.WND_PROP_ASPECT_RATIO)
-
             print("Using window with OpenGL support")
 
         except BaseException:
             cv2.namedWindow(win_name,
                             cv2.WINDOW_NORMAL | cv2.WND_PROP_ASPECT_RATIO)
-
-            if self.mousecam_data.is_valid():
-                cv2.namedWindow("mousecam",
-                                cv2.WINDOW_NORMAL | cv2.WND_PROP_ASPECT_RATIO)
 
             print("Using window without OpenGL support")
 
@@ -970,14 +815,6 @@ class AnnotatorWidget(qw.QWidget):
             self.thread.terminate()
             self.thread.wait()
             self.thread = None
-
-        self.data.close()
-        self.mousecam_data.close()
-
-        if not self.keep_memmap_files:
-
-            self.data.remove()
-            self.mousecam_data.remove()
 
     def closeEvent(self, event):
 
@@ -998,10 +835,10 @@ class AnnotatorWidget(qw.QWidget):
 
     def get_frame_count(self):
 
-        if self.data is None:
+        if self.video_handler is None:
             return -1
         else:
-            return len(self.data.timestamps)
+            return len(self.video_handler.timestamps)
 
     def fps_slider_changed(self):
 
@@ -1015,9 +852,9 @@ class AnnotatorWidget(qw.QWidget):
         pos = self.pos_slider.value()
 
         if self.mode == self.MODE_PLAYING:
-            self.current_group = self.data.assigned_groups[pos]
+            self.current_state = self.video_handler.annotations[pos]
         else:
-            self.data.assigned_groups[pos] = self.current_group
+            self.video_handler.annotations[pos] = self.current_state
 
             self.update_state_label()
 
@@ -1044,7 +881,7 @@ class AnnotatorWidget(qw.QWidget):
 
     def button_clicked(self, index):
 
-        self.current_group = index
+        self.current_state = index
         self.update_state_label()
         self.mode = self.MODE_ASSIGNING
 
@@ -1052,7 +889,7 @@ class AnnotatorWidget(qw.QWidget):
 
         if len(ind) > 0:
 
-            self.data.assigned_groups[ind] = labels
+            self.video_handler.annotations[ind] = labels
 
             if self.handler is not None and \
                     self.handler.get_status() != PlaybackHandler.RUNNING:
@@ -1067,7 +904,7 @@ class AnnotatorWidget(qw.QWidget):
 
     def update_state_label(self):
 
-        name = self.get_current_group_name()
+        name = self.get_current_state_name()
         self.state_label.setText('<b>Current state: {}</b>'.format(name))
 
     def create_button_grid(self, buttons_per_row=3):
@@ -1075,26 +912,26 @@ class AnnotatorWidget(qw.QWidget):
         grid = qw.QGridLayout()
         grid.setSpacing(10)
 
-        groups = self.get_groups()
-        group_names = self.get_group_names()
-        n_groups = len(group_names)
+        states = self.get_states()
+        state_names = self.get_state_names()
+        n_states = len(state_names)
 
-        n_rows = int(np.ceil(n_groups / float(buttons_per_row)))
+        n_rows = int(np.ceil(n_states / float(buttons_per_row)))
         y_offset = 0
 
         for i in range(n_rows):
             for j in range(buttons_per_row):
 
                 index = i * buttons_per_row + j
-                if index < n_groups:
+                if index < n_states:
 
-                    gid = groups[index]
-                    name = group_names[index]
+                    gid = states[index]
+                    name = state_names[index]
                     label = '%d &%s' % (gid, name)
 
                     button = qw.QPushButton(label)
                     button.clicked.connect(partial(self.button_clicked,
-                                                   groups[index]))
+                                                   states[index]))
                     grid.addWidget(button, y_offset+i, j)
 
                     cb = partial(self.shortcut_pressed, name)
@@ -1110,72 +947,17 @@ class AnnotatorWidget(qw.QWidget):
 
         return grid
 
-    def get_groups(self):
+    def get_states(self):
 
-        return sorted(self._groups.keys())
+        return sorted(self.states.keys())
 
-    def get_group_names(self):
+    def get_state_names(self):
 
-        return [self._groups[k] for k in self.get_groups()]
+        return [self.states[k] for k in self.get_states()]
 
-    def get_current_group_name(self):
+    def get_current_state_name(self):
 
-        return self._groups[self.current_group]
-
-    def read_data(self):
-
-        frame_path = op.join(self.rec_path, 'frames')
-
-        self.data = VideoDataHandler(frame_path,
-                                     max_num_frames=self.max_num_frames,
-                                     use_memmap=self.use_memmap,
-                                     force_reload=self.force_reload,
-                                     groups=self._groups)
-        self.data.prepare()
-
-        annot_path = op.join(self.rec_path, 'video_annotations.npz')
-        if op.exists(annot_path):
-
-            print("Reading existing annotations from {}".format(annot_path))
-            annot = dict(**np.load(annot_path))
-
-            data_updated = False
-
-            if len(self.data.timestamps) != len(annot['timestamps']):
-                # safeguard for compatibility with annotations created using
-                # a previous version of this widget; classify all invalid
-                # frames as -1 (= 'Invalid') and update the other variables
-                N = self.data.timestamps.shape[0]
-                groups = annot['assigned_groups']
-                new_groups = -1 * np.ones((N,), dtype=groups.dtype)
-                new_groups[self.data.valid] = groups
-                annot['assigned_groups'] = new_groups
-                annot['timestamps'] = self.data.timestamps
-                annot['groups'] = self._groups
-
-                data_updated = True
-
-            if 'valid' not in annot:
-                annot['valid'] = self.data.valid
-                data_updated = True
-
-            if data_updated:
-                # rewrite updated annotations
-                print "Updating video annotations file to new format"
-                np.savez(annot_path, **annot)
-
-            if np.all(self.data.timestamps == annot['timestamps']):
-                labels = annot['assigned_groups']
-                print "Done!"
-            else:
-                raise ValueError("Timestamps in video and annotations "
-                                 "file differ")
-
-        else:
-            labels = np.zeros((self.data.timestamps.shape[0],),
-                              dtype=np.int8)
-
-        self.data.assigned_groups = labels
+        return self.states[self.current_state]
 
     def start_thread(self):
 
@@ -1191,25 +973,18 @@ class AnnotatorWidget(qw.QWidget):
 
     def update_gui(self, x, update_slider=True):
 
-        mat, ts = self.data.get_data(x)
+        mat, ts = self.video_handler.get_data(x)
         cv2.imshow(self.win_name, mat / 255.)
-
-        if self.mousecam_data.is_valid():
-
-            frame = self.mousecam_data.get_data(ts)
-
-            if frame is not None:
-                cv2.imshow('mousecam', frame)
 
         cv2.waitKey(1)
 
         if self.mode == self.MODE_ASSIGNING:
-            self.data.assigned_groups[x] = self.current_group
+            self.video_handler.annotations[x] = self.current_state
 
         if update_slider:
             self.pos_slider.setValue(x)
 
-        self.plot_widget.plot_labels(self.data.assigned_groups, pos=x)
+        self.plot_widget.plot_labels(self.video_handler.annotations, pos=x)
 
     def start(self):
 
@@ -1234,14 +1009,7 @@ class AnnotatorWidget(qw.QWidget):
 
         self.stop()
         time.sleep(0.25)
-
-        result_file = op.join(self.rec_path, 'video_annotations.npz')
-        print("Saving data to file: {}".format(result_file))
-        np.savez(result_file,
-                 timestamps=self.data.timestamps,
-                 assigned_groups=self.data.assigned_groups,
-                 groups=self._groups,
-                 valid=self.data.valid)
+        self.video_handler.save()
 
     def close_and_exit(self):
 
@@ -1250,27 +1018,79 @@ class AnnotatorWidget(qw.QWidget):
 
 
 @click.command()
-@click.argument('rec_path', type=click.Path(exists=True))
-@click.option('--frames', '-F', default=np.Inf,
+@click.argument('video_file', type=click.Path(exists=True))
+@click.option('--timestamp-file', '-t', default=None,
+              help='A numpy (npy) or text file with video timestamps '
+                   '(one entry per row)')
+@click.option('--annotation-file', '-a', default=None,
+              help='File with video annotations (one entry per video frame)')
+@click.option('--fps', '-r', default=30.,
+              help="frame rate of video file (required for h264 files)")
+@click.option('--max-frames', '-n', default=np.Inf,
               help="The maximum number of frames. Default: Inf")
-@click.option('--nomemmap', '-n', is_flag=True,
-              help="Don't use memmap files as temporary frame storage")
+@click.option('--subsample', '-s', default=2,
+              help="Subsample video data for faster processing")
 @click.option('--force', '-f', is_flag=True,
-              help="Force rewriting of memmap files that already exist")
+              help="Force rewriting of memmap files if already exist")
 @click.option('--keep', '-k', is_flag=True,
               help="Keep temporary memmap files after existing")
-def cli(rec_path=None, frames=np.Inf, nomemmap=False, force=False, keep=False):
+@click.option('--lfp-file', '-l', default=None,
+              help='Numpy (npz) file with LFP data ("data" and "samplerate")')
+@click.option('--format', '-F', default='csv',
+              help='Output file format. Can be either "csv" or "npy". '
+                   'Default: csv')
+@click.option('--state-file', '-S', default=None,
+              help='csv or npy file with behavioral states.'
+                   'For csv format: the first column contains state label '
+                   '(e.g. grooming) and the decond column name of the state. '
+                   'For npy format: a dict where keys are state labels and '
+                   'values represent state names. If no state file is '
+                   'supplied default states will be used.')
+def cli(video_file=None, timestamp_file=None, annotation_file=None,
+        fps=None, max_frames=np.Inf, subsample=None, force=False, keep=False,
+        lfp_file=None, format=None, state_file=None):
 
-    print("Annotating recording: {}".format(rec_path))
+    print("Annotating video:", video_file)
+
+    # wrap data into container
+    video_handler = VideoDataHandler(video_file,
+                                     fps=fps,
+                                     timestamps=timestamp_file,
+                                     annotations=annotation_file,
+                                     max_num_frames=max_frames,
+                                     force_reload=force,
+                                     subsample=subsample,
+                                     output_format=format)
+    video_handler.prepare()
+
+    if lfp_file is not None:
+        lfp_handler = LfpDataHandler(lfp_file)
+    else:
+        lfp_handler = None
+
+    if state_file is None:
+        states = None
+    else:
+        assert op.exists(state_file), "state file not a valid file!"
+
+        ext = op.splitext(state_file)
+        if ext == '.csv':
+            states = {}
+            for line in np.genfromtxt(state_file, dtype=None, delimiter=','):
+                states[int(line[0])] = str(line[1])
+
+        elif ext == 'npz':
+            states = np.load(state_file).item()
 
     app = qw.QApplication([])
-    w = AnnotatorWidget(rec_path,
-                        max_num_frames=frames,
-                        use_memmap=not nomemmap,
-                        force_reload=force,
-                        keep_memmap_files=keep)
+    w = AnnotatorWidget(video_handler, lfp_handler, states=states)
     w.show()
-    sys.exit(app.exec_())
+    exit_status = app.exec_()
+
+    if not keep:
+        video_handler.cleanup()
+
+    sys.exit(exit_status)
 
 
 if __name__ == '__main__':
